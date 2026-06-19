@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]==21.6
+anthropic>=0.40
+openai>=1.50
+notion-client>=2.2,<3
+twilio>=9.0
+python-dotenv>=1.0

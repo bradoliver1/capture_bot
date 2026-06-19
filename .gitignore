@@ -1,0 +1,12 @@
+# Secrets — NEVER commit
+.env
+env
+
+# Local runtime artifacts
+.venv/
+__pycache__/
+*.pyc
+reminders.db
+bot.log
+nohup.out
+.DS_Store
