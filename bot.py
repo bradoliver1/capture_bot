@@ -107,6 +107,12 @@ PROPOSALS: dict[str, dict] = {}
 # --------------------------------------------------------------------------- #
 class ReminderStore:
     def __init__(self, path: str):
+        # Make sure the DB's parent dir exists (e.g. a Railway volume at /data).
+        # If the volume isn't mounted, fall back to creating the dir in container
+        # storage so the bot still boots instead of crash-looping on startup.
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS reminders ("
