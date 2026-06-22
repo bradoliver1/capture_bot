@@ -85,6 +85,30 @@ CATEGORIES = ["Work", "Personal", "Katherine"]
 PRIORITIES = ["High", "Medium", "Low"]
 LANES = ["call", "reminder", "followup", "task"]
 
+# Words/phrases that force the "call" lane (interrupt me — offer call/notify).
+# Add or remove your own here; matching is case-insensitive and whole-word.
+# Keep these to genuine "interrupt me" signals — generic words like "remind"
+# or "make sure" would route almost everything to the call prompt.
+CALL_TRIGGERS = [
+    "urgent",
+    "important",
+    "asap",
+    "critical",
+    "emergency",
+    "call me",
+    "right away",
+    "immediately",
+    "time sensitive",
+    "time-sensitive",
+    "drop everything",
+    "high priority",
+    "don't let me forget",
+    "interrupt me",
+]
+_CALL_TRIGGER_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in CALL_TRIGGERS) + r")\b", re.I
+)
+
 logging.basicConfig(format="%(asctime)s  %(levelname)s  %(message)s", level=logging.INFO)
 log = logging.getLogger("capture-bot")
 
@@ -234,7 +258,8 @@ def parse_items(text: str) -> list[dict]:
         if it["lane"] == "reminder" and not it.get("when"):
             it["lane"] = "followup"
         # Urgency words always mean the call lane, even if he wrote "reminder".
-        if re.search(r"\b(urgent|important|call me|asap)\b", text, re.I):
+        # Trigger words always mean the call lane, even if he wrote "reminder".
+        if _CALL_TRIGGER_RE.search(text):
             it["lane"] = "call"
         cleaned.append(it)
     return cleaned
