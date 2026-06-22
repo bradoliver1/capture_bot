@@ -16,8 +16,6 @@ Scheduled reminders are persisted to SQLite so they survive restarts/redeploys.
 Config is via environment variables — see .env.example.
 """
 
-from __future__ import annotations
-
 import os
 import re
 import json
@@ -83,7 +81,7 @@ CALL_LEAD_MINUTES = int(os.environ.get("CALL_LEAD_MINUTES", "5"))
 NUDGE_TIMES = os.environ.get("NUDGE_TIMES", "08:00,13:00,16:30")
 DB_PATH = os.environ.get("REMINDER_DB_PATH", "reminders.db")
 
-CATEGORIES = ["Work", "Personal", "Katherine", "Church"]
+CATEGORIES = ["Work", "Personal", "Katherine"]
 PRIORITIES = ["High", "Medium", "Low"]
 LANES = ["call", "reminder", "followup", "task"]
 
@@ -101,18 +99,16 @@ twilio_client = (
 
 # Pending call proposals awaiting a tap: token -> {chat_id, when_iso, message}
 PROPOSALS: dict[str, dict] = {}
+# Chats we've asked "when?" and are waiting on a typed/spoken time: chat_id -> {action, message}
+AWAITING_TIME: dict[int, dict] = {}
+# Chats that tapped "Note" and owe us note text next: chat_id -> {page_id, task}
+AWAITING_NOTE: dict[int, dict] = {}
 
 # --------------------------------------------------------------------------- #
 # Tiny persistent store for scheduled reminders (survives restarts)
 # --------------------------------------------------------------------------- #
 class ReminderStore:
     def __init__(self, path: str):
-        # Make sure the DB's parent dir exists (e.g. a Railway volume at /data).
-        # If the volume isn't mounted, fall back to creating the dir in container
-        # storage so the bot still boots instead of crash-looping on startup.
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS reminders ("
@@ -161,28 +157,46 @@ no markdown fences, in exactly this shape:
 
 Fields:
 - "task": short, clear action starting with a verb.
-- "category": one of Work, Personal, Katherine, Church.
-    Katherine = anything about Katherine, Austin's estate, her insurance/legal/finances,
-    or supporting her.
-- "priority": one of High, Medium, Low.
-- "lane": one of call, reminder, followup, task. Choose carefully:
-    * "call"     = time-critical AND must interrupt him. There is a specific clock
-                   time and missing it matters — e.g. "call Katherine at 3:15",
-                   "leave by 4:30 for the airport", or any specific-time item flagged
-                   urgent / "make sure" / "don't let me miss" / "call me". MUST have a
-                   clock time in "when".
-    * "reminder" = tied to a specific clock time but routine, not critical
-                   ("standup at 10", "take meds at 9"). MUST have a clock time in "when".
-    * "followup" = must get done today or by a date, but NO specific clock time
-                   ("make sure I send the contract today", "don't forget to call the
-                   bank this week"). Put the deadline in "due".
+- "category": exactly one of Work, Personal, Katherine. (There is no Church bucket —
+  church belongs in Personal.) Use how Brad talks to decide:
+    * Personal = his home and life, home projects, music, church, and his family —
+                 Hannah, Eliza, Emmie.
+    * Katherine = Katherine, her lawyers, Austin Greer, Huskey, buyouts, tasks at
+                  Katherine's house, conversations he needs to have with her, and her
+                  estate / insurance / finances.
+    * Work = Culture Apparel and the team. Anything HR, hiring, or otherwise business
+             related. People and their roles:
+               - Ben, Cam (a.k.a. Cameron) — outbound sales
+               - Abby — marketing / assistant / account management
+               - Mia — paid ads and marketing
+               - Peter — COO, Brad's #2
+               - Vitaliy — operations
+               - Gian — production manager
+               - Parker, Asher, Jeff, Zach — production
+             A task naming any of these people, by itself, is almost always Work
+             (unless clearly about his personal life).
+- "priority": one of High, Medium, Low. If he says "important" or "urgent", set High.
+- "lane": one of call, reminder, followup, task.
+    * "call"     = he flagged it "important" / "urgent" / "call me", OR it's a specific-
+                   time thing where missing it matters ("call Katherine at 3:15",
+                   "leave by 4:30"). This lane lets him pick call vs notification vs plain
+                   task. A clock time in "when" is preferred but NOT required.
+    * "reminder" = a specific clock time but routine, not urgent ("standup at 10").
+                   MUST have a clock time in "when".
+    * "followup" = must get done today or by a date, but no clock time and not flagged
+                   urgent ("make sure I send the contract today"). Put the date in "due".
     * "task"     = everything else. The default. Most items are this.
-- "when": local datetime "YYYY-MM-DDTHH:MM" for call/reminder lanes, else null.
+- "when": local datetime "YYYY-MM-DDTHH:MM" if a clock time is given, else null.
 - "due": date "YYYY-MM-DD" for followup/task deadlines, else null.
-- "notes": extra context/names/links, else null.
+- "notes": If he gives extra detail or context beyond the bare action — the why, names,
+  amounts, a deadline reason, anything useful — put that context here. If he just states
+  a thing with no extra detail, leave null. Keep the "task" itself short; the color goes
+  in notes.
 
-Be conservative with "call" — only when a miss genuinely costs him. When unsure between
-call and reminder, choose reminder. When unsure between followup and task, choose task."""
+When unsure between reminder and task, choose task. Use "call" whenever he signals
+urgency/importance ("urgent", "important", "call me", "ASAP") OR a real time-critical
+moment — and "urgent"/"important" ALWAYS win over the word "reminder": an "urgent
+reminder" is a call, not a reminder."""
 
 
 def _extract_json(raw: str) -> dict:
@@ -216,9 +230,12 @@ def parse_items(text: str) -> list[dict]:
             it["priority"] = "Medium"
         if it.get("lane") not in LANES:
             it["lane"] = "task"
-        # A "call" with no time can't be a call — drop it to a followup.
-        if it["lane"] in ("call", "reminder") and not it.get("when"):
+        # A routine "reminder" needs a time; without one it's really a followup.
+        if it["lane"] == "reminder" and not it.get("when"):
             it["lane"] = "followup"
+        # Urgency words always mean the call lane, even if he wrote "reminder".
+        if re.search(r"\b(urgent|important|call me|asap)\b", text, re.I):
+            it["lane"] = "call"
         cleaned.append(it)
     return cleaned
 
@@ -248,7 +265,7 @@ def query_open_due_today() -> list[str]:
         database_id=NOTION_DB_ID,
         filter={
             "and": [
-                {"property": "Status", "select": {"equals": "Inbox"}},
+                {"property": "Done", "checkbox": {"equals": False}},
                 {"property": "Due", "date": {"on_or_before": today}},
             ]
         },
@@ -258,6 +275,54 @@ def query_open_due_today() -> list[str]:
         title = row["properties"]["Task"]["title"]
         out.append(title[0]["plain_text"] if title else "(untitled)")
     return out
+
+
+def _plain(rich: list) -> str:
+    return "".join(seg.get("plain_text", "") for seg in (rich or []))
+
+
+def list_open_tasks(limit: int = 12) -> list[dict]:
+    """Open (Status=Inbox) Capture Inbox tasks, ordered High -> Low, then by due date."""
+    res = notion.databases.query(
+        database_id=NOTION_DB_ID,
+        filter={"property": "Done", "checkbox": {"equals": False}},
+        page_size=100,
+    )
+    rank = {"High": 0, "Medium": 1, "Low": 2}
+    tasks = []
+    for row in res.get("results", []):
+        p = row["properties"]
+        title = _plain(p["Task"]["title"]) or "(untitled)"
+        cat = (p.get("Category", {}).get("select") or {}).get("name", "")
+        prio = (p.get("Priority", {}).get("select") or {}).get("name", "Medium")
+        notes = _plain(p.get("Notes", {}).get("rich_text", []))
+        due = (p.get("Due", {}).get("date") or {}).get("start", "")
+        tasks.append(
+            {"id": row["id"], "task": title, "category": cat,
+             "priority": prio, "notes": notes, "due": due}
+        )
+    tasks.sort(key=lambda t: (rank.get(t["priority"], 1), t["due"] or "9999"))
+    return tasks[:limit]
+
+
+def mark_task_done(page_id: str) -> None:
+    notion.pages.update(
+        page_id=page_id,
+        properties={"Done": {"checkbox": True}, "Status": {"select": {"name": "Done"}}},
+    )
+
+
+def append_task_note(page_id: str, text: str) -> str:
+    """Append text to a task's Notes (keeping what's already there). Returns the combined note."""
+    page = notion.pages.retrieve(page_id=page_id)
+    existing = _plain(page["properties"].get("Notes", {}).get("rich_text", []))
+    combined = (existing + "\n" + text).strip() if existing else text.strip()
+    combined = combined[:1900]
+    notion.pages.update(
+        page_id=page_id,
+        properties={"Notes": {"rich_text": [{"text": {"content": combined}}]}},
+    )
+    return combined
 
 
 # --------------------------------------------------------------------------- #
@@ -327,10 +392,122 @@ def _parse_when(when_iso: str) -> datetime.datetime | None:
         return None
 
 
+def _fmt_when(dt: datetime.datetime) -> str:
+    """Time only if today; otherwise include the date so far-out items are clear."""
+    now = datetime.datetime.now(TZ)
+    if dt.date() == now.date():
+        return f"{dt:%-I:%M %p}"
+    if dt.year == now.year:
+        return f"{dt:%a %b %-d, %-I:%M %p}"
+    return f"{dt:%a %b %-d %Y, %-I:%M %p}"
+
+
+def _offset_from_code(code: str, now: datetime.datetime) -> datetime.datetime:
+    if code == "15m":
+        return now + datetime.timedelta(minutes=15)
+    if code == "30m":
+        return now + datetime.timedelta(minutes=30)
+    if code == "1h":
+        return now + datetime.timedelta(hours=1)
+    if code == "3h":
+        return now + datetime.timedelta(hours=3)
+    if code == "eve":
+        t = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        return t if t > now else t + datetime.timedelta(days=1)
+    if code == "tom":
+        return (now + datetime.timedelta(days=1)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+    return now + datetime.timedelta(minutes=30)
+
+
+def _when_keyboard(token: str, action: str) -> InlineKeyboardMarkup:
+    def b(label, code):
+        return InlineKeyboardButton(label, callback_data=f"when:{token}:{action}:{code}")
+
+    return InlineKeyboardMarkup(
+        [
+            [b("15 min", "15m"), b("30 min", "30m"), b("1 hr", "1h")],
+            [b("3 hr", "3h"), b("6 pm", "eve"), b("Tom 9am", "tom")],
+            [b("⌨️ Other time", "other")],
+        ]
+    )
+
+
+def _schedule_choice(job_queue, chat_id, action, fire_at, msg) -> None:
+    schedule_reminder(job_queue, chat_id, fire_at, "call" if action == "call" else "ping", msg)
+
+
+def _choice_confirm(action: str, fire_at: datetime.datetime, msg: str) -> str:
+    t = _fmt_when(fire_at)
+    if action == "call":
+        if twilio_client:
+            return f'📞 Call set for {t}: "{msg}"'
+        return (
+            f'🚨 Set for {t}: "{msg}"\n'
+            "(Loud Telegram ping — add your Twilio keys for a real call.)"
+        )
+    return f'🔔 Notification set for {t}: "{msg}"'
+
+
+def _parse_time_phrase(text: str) -> datetime.datetime | None:
+    """Turn a free-text time ('in 20 min', '3:15pm', 'tomorrow 9am') into a datetime."""
+    now = datetime.datetime.now(TZ).strftime("%A, %Y-%m-%dT%H:%M")
+    try:
+        resp = anthropic_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=40,
+            system=(
+                "Convert the user's phrase to one local datetime formatted exactly as "
+                f"YYYY-MM-DDTHH:MM, relative to now ({now}, America/Chicago). "
+                "Reply with ONLY that datetime, or the word null if there is no time."
+            ),
+            messages=[{"role": "user", "content": text}],
+        )
+        raw = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+        m = re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", raw)
+        return _parse_when(m.group(0)) if m else None
+    except Exception:
+        return None
+
+
 async def _handle_items(update, context, text, source):
     if not text or not text.strip():
         await update.message.reply_text("⚠️ Empty message — nothing saved.")
         return
+
+    # If we asked "when?" for an urgent item, treat this message as the answer.
+    chat_id = update.effective_chat.id
+
+    # If they tapped "Note" on a task, this message is the note text.
+    note_pend = AWAITING_NOTE.pop(chat_id, None)
+    if note_pend:
+        try:
+            append_task_note(note_pend["page_id"], text.strip())
+            await update.message.reply_text(f'📝 Note added to "{note_pend["task"]}".')
+        except Exception as e:  # noqa: BLE001
+            log.exception("note append failed")
+            await update.message.reply_text(f"⚠️ Couldn't save that note: {e}")
+        return
+
+    pend = AWAITING_TIME.pop(chat_id, None)
+    if pend:
+        fire_at = _parse_time_phrase(text)
+        if fire_at:
+            now = datetime.datetime.now(TZ)
+            if fire_at <= now:
+                fire_at = now + datetime.timedelta(seconds=10)
+            _schedule_choice(context.job_queue, chat_id, pend["action"], fire_at, pend["message"])
+            await update.message.reply_text(
+                _choice_confirm(pend["action"], fire_at, pend["message"])
+            )
+            return
+        await update.message.reply_text(
+            f'(Couldn\'t catch a time — left "{pend["message"]}" as a filed task. '
+            "Treating your message as something new:)"
+        )
+        # fall through and process this text as a fresh capture
+
     try:
         items = parse_items(text)
     except Exception as e:  # noqa: BLE001
@@ -356,26 +533,23 @@ async def _handle_items(update, context, text, source):
 
         lane = it["lane"]
         if lane == "call":
-            when = _parse_when(it.get("when", ""))
-            if not when:
-                filed_lines.append(f'✅ {it["category"]} · {it["priority"]} · "{it["task"]}"')
-                continue
+            when = _parse_when(it.get("when") or "")
             token = uuid.uuid4().hex[:8]
             PROPOSALS[token] = {
                 "chat_id": chat_id,
-                "when_iso": when.isoformat(),
+                "when_iso": when.isoformat() if when else None,
                 "message": it["task"],
             }
             kb = InlineKeyboardMarkup(
                 [[
-                    InlineKeyboardButton("📞 Call me", callback_data=f"call:{token}"),
-                    InlineKeyboardButton("⏰ Just ping", callback_data=f"ping:{token}"),
-                    InlineKeyboardButton("🗑️", callback_data=f"cancel:{token}"),
+                    InlineKeyboardButton("📞 Call", callback_data=f"call:{token}"),
+                    InlineKeyboardButton("🔔 Notify", callback_data=f"notify:{token}"),
+                    InlineKeyboardButton("📝 Just a task", callback_data=f"task:{token}"),
                 ]]
             )
+            when_label = f" — {_fmt_when(when)}" if when else ""
             await update.message.reply_text(
-                f'🚨 *{it["task"]}* at {when:%-I:%M %p}.\n'
-                f"I'll call you ~{CALL_LEAD_MINUTES} min before. Confirm?",
+                f'🚨 *{it["task"]}*{when_label}\nHow do you want this — call, notify, or just filed?',
                 reply_markup=kb,
                 parse_mode="Markdown",
             )
@@ -383,7 +557,7 @@ async def _handle_items(update, context, text, source):
             when = _parse_when(it.get("when", ""))
             if when and when > now:
                 schedule_reminder(context.job_queue, chat_id, when, "ping", it["task"])
-                filed_lines.append(f'⏰ {when:%-I:%M %p} · "{it["task"]}"')
+                filed_lines.append(f'⏰ {_fmt_when(when)} · "{it["task"]}"')
             else:
                 filed_lines.append(f'✅ "{it["task"]}" (time passed — filed)')
         elif lane == "followup":
@@ -399,36 +573,90 @@ async def _handle_items(update, context, text, source):
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    action, _, token = q.data.partition(":")
-    p = PROPOSALS.pop(token, None)
+    now = datetime.datetime.now(TZ)
+    data = q.data
+
+    # Task list actions (from /today): complete or add a note.
+    if data.startswith("done:"):
+        page_id = data[5:]
+        label = (q.message.text or "task").splitlines()[0] if q.message and q.message.text else "task"
+        try:
+            mark_task_done(page_id)
+            await q.edit_message_text(f"✅ Done — {label}")
+        except Exception as e:  # noqa: BLE001
+            log.exception("mark done failed")
+            await q.edit_message_text(f"⚠️ Couldn't mark it done: {e}")
+        return
+
+    if data.startswith("note:"):
+        page_id = data[5:]
+        chat_id = update.effective_chat.id
+        label = (q.message.text or "this task").splitlines()[0] if q.message and q.message.text else "this task"
+        AWAITING_NOTE[chat_id] = {"page_id": page_id, "task": label}
+        await context.bot.send_message(
+            chat_id, "📝 Send the note (text or voice) and I'll add it to that task."
+        )
+        return
+
+    # Second step: a specific "when" was chosen for an urgent item.
+    if data.startswith("when:"):
+        _, token, action, code = data.split(":")
+        p = PROPOSALS.pop(token, None)
+        if not p:
+            await q.edit_message_text("This one expired — just send it again.")
+            return
+        if code == "other":
+            AWAITING_TIME[p["chat_id"]] = {"action": action, "message": p["message"]}
+            await q.edit_message_text(
+                f'⌨️ When for "{p["message"]}"? Reply with a time — '
+                '"3:15pm", "in 20 min", "tomorrow 9am".'
+            )
+            return
+        fire_at = _offset_from_code(code, now)
+        _schedule_choice(context.job_queue, p["chat_id"], action, fire_at, p["message"])
+        await q.edit_message_text(_choice_confirm(action, fire_at, p["message"]))
+        return
+
+    # First step: call / notify / just-a-task.
+    action, _, token = data.partition(":")
+    p = PROPOSALS.get(token)
     if not p:
         await q.edit_message_text("This one expired — just send it again.")
         return
-    when = _parse_when(p["when_iso"])
     msg = p["message"]
-    now = datetime.datetime.now(TZ)
+    when = _parse_when(p["when_iso"]) if p.get("when_iso") else None
 
-    if action == "cancel":
-        await q.edit_message_text(f'🗑️ Cancelled: "{msg}"')
+    if action == "task":
+        PROPOSALS.pop(token, None)
+        await q.edit_message_text(f'📝 Filed as a task: "{msg}"')
         return
 
+    # For a CALL, always ask for an explicit date + time. This handles far-out
+    # timing like "in 3 weeks" that the quick same-day presets can't express.
     if action == "call":
-        fire_at = when - datetime.timedelta(minutes=CALL_LEAD_MINUTES)
+        PROPOSALS.pop(token, None)
+        AWAITING_TIME[p["chat_id"]] = {"action": "call", "message": msg}
+        hint = f" (I read it as {_fmt_when(when)} — confirm or change it)" if when else ""
+        await q.edit_message_text(
+            f'📞 When should I call you about "{msg}"?{hint}\n'
+            'Reply with a date and time — e.g. "July 13 at 1pm", "in 3 weeks at noon", '
+            '"tomorrow 9am".'
+        )
+        return
+
+    # Notify: quick same-day timing is fine.
+    if when:
+        PROPOSALS.pop(token, None)
+        fire_at = when
         if fire_at <= now:
             fire_at = now + datetime.timedelta(seconds=10)
-        schedule_reminder(context.job_queue, p["chat_id"], fire_at, "call", msg)
-        if twilio_client:
-            await q.edit_message_text(f'📞 Set — I\'ll call you ~{when:%-I:%M %p}: "{msg}"')
-        else:
-            await q.edit_message_text(
-                f'🚨 Set for {when:%-I:%M %p}: "{msg}"\n'
-                "(Calls aren't configured yet — you'll get a loud Telegram ping. "
-                "Add Twilio keys to enable real calls.)"
-            )
-    else:  # ping
-        fire_at = when if when > now else now + datetime.timedelta(seconds=10)
-        schedule_reminder(context.job_queue, p["chat_id"], fire_at, "ping", msg)
-        await q.edit_message_text(f'⏰ Ping set for {when:%-I:%M %p}: "{msg}"')
+        _schedule_choice(context.job_queue, p["chat_id"], action, fire_at, msg)
+        await q.edit_message_text(_choice_confirm(action, fire_at, msg))
+    else:
+        # No time given — ask when (keep the proposal alive for the second tap).
+        await q.edit_message_text(
+            f'🕒 When for "{msg}"?', reply_markup=_when_keyboard(token, action)
+        )
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,12 +708,50 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     await update.message.reply_text(
-        "👋 Ready. Talk or type — I'll sort each thing into the right lane:\n"
-        "• urgent w/ a time → I propose a call (one tap to confirm)\n"
-        "• a time, routine → I ping you then\n"
+        "👋 Ready. Talk or type — I'll sort each thing into Work, Personal, or Katherine:\n"
+        "• say *urgent / important* (or give a time) → I ask: call, notify, or just file it\n"
         "• must-do today → I file it and nudge you\n"
-        "• everything else → straight to your inbox"
+        "• everything else → straight to your inbox\n"
+        "Add detail and I'll tuck it into the notes.",
+        parse_mode="Markdown",
     )
+
+
+_PRIO_EMOJI = {"High": "🔴", "Medium": "🟡", "Low": "⚪"}
+
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    gate = _gate(update)
+    if gate is not None:
+        if gate:
+            await update.message.reply_text(gate, parse_mode="Markdown")
+        return
+    try:
+        tasks = list_open_tasks(limit=12)
+    except Exception as e:  # noqa: BLE001
+        log.exception("list tasks failed")
+        await update.message.reply_text(f"⚠️ Couldn't load your tasks: {e}")
+        return
+    if not tasks:
+        await update.message.reply_text("🎉 Nothing open — your inbox is clear.")
+        return
+
+    await update.message.reply_text(f"🗂️ Your open tasks ({len(tasks)}) — tap to close out:")
+    for t in tasks:
+        emoji = _PRIO_EMOJI.get(t["priority"], "🟡")
+        cat = f"{t['category']} — " if t["category"] else ""
+        line = f"{emoji} {cat}{t['task']}"
+        if t["due"]:
+            line += f"\n⏳ due {t['due']}"
+        if t["notes"]:
+            line += f"\n📝 {t['notes']}"
+        kb = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("✓ Done", callback_data=f"done:{t['id']}"),
+                InlineKeyboardButton("📝 Note", callback_data=f"note:{t['id']}"),
+            ]]
+        )
+        await update.message.reply_text(line, reply_markup=kb)
 
 
 # --------------------------------------------------------------------------- #
@@ -548,6 +814,8 @@ def main() -> None:
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("tasks", cmd_today))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
