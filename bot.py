@@ -418,6 +418,14 @@ def _offset_from_code(code: str, now: datetime.datetime) -> datetime.datetime:
         return (now + datetime.timedelta(days=1)).replace(
             hour=9, minute=0, second=0, microsecond=0
         )
+    if code == "tom_pm":
+        return (now + datetime.timedelta(days=1)).replace(
+            hour=13, minute=0, second=0, microsecond=0
+        )
+    if code == "3d":
+        return (now + datetime.timedelta(days=3)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
     return now + datetime.timedelta(minutes=30)
 
 
@@ -427,9 +435,9 @@ def _when_keyboard(token: str, action: str) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(
         [
-            [b("15 min", "15m"), b("30 min", "30m"), b("1 hr", "1h")],
-            [b("3 hr", "3h"), b("6 pm", "eve"), b("Tom 9am", "tom")],
-            [b("⌨️ Other time", "other")],
+            [b("1 hr", "1h"), b("3 hr", "3h"), b("Tonight", "eve")],
+            [b("Tom 9am", "tom"), b("Tom 1pm", "tom_pm"), b("In 3 days", "3d")],
+            [b("📅 Pick date & time", "other")],
         ]
     )
 
@@ -608,8 +616,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if code == "other":
             AWAITING_TIME[p["chat_id"]] = {"action": action, "message": p["message"]}
             await q.edit_message_text(
-                f'⌨️ When for "{p["message"]}"? Reply with a time — '
-                '"3:15pm", "in 20 min", "tomorrow 9am".'
+                f'📅 When for "{p["message"]}"? Reply with a date and time — '
+                '"July 13 at 1pm", "Friday 3:15pm", "in 3 weeks at noon".'
             )
             return
         fire_at = _offset_from_code(code, now)
@@ -631,32 +639,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await q.edit_message_text(f'📝 Filed as a task: "{msg}"')
         return
 
-    # For a CALL, always ask for an explicit date + time. This handles far-out
-    # timing like "in 3 weeks" that the quick same-day presets can't express.
+    # For a CALL, let Brad pick the date/time himself — never auto-suggest one.
     if action == "call":
-        PROPOSALS.pop(token, None)
-        AWAITING_TIME[p["chat_id"]] = {"action": "call", "message": msg}
-        hint = f" (I read it as {_fmt_when(when)} — confirm or change it)" if when else ""
         await q.edit_message_text(
-            f'📞 When should I call you about "{msg}"?{hint}\n'
-            'Reply with a date and time — e.g. "July 13 at 1pm", "in 3 weeks at noon", '
-            '"tomorrow 9am".'
+            f'📞 When should I call you about "{msg}"?',
+            reply_markup=_when_keyboard(token, "call"),
         )
         return
 
-    # Notify: quick same-day timing is fine.
-    if when:
-        PROPOSALS.pop(token, None)
-        fire_at = when
-        if fire_at <= now:
-            fire_at = now + datetime.timedelta(seconds=10)
-        _schedule_choice(context.job_queue, p["chat_id"], action, fire_at, msg)
-        await q.edit_message_text(_choice_confirm(action, fire_at, msg))
-    else:
-        # No time given — ask when (keep the proposal alive for the second tap).
-        await q.edit_message_text(
-            f'🕒 When for "{msg}"?', reply_markup=_when_keyboard(token, action)
-        )
+    # Notify: same tap-to-pick date/time as calls, for consistency — no auto time.
+    await q.edit_message_text(
+        f'🔔 When should I ping you about "{msg}"?',
+        reply_markup=_when_keyboard(token, "notify"),
+    )
+    return
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
